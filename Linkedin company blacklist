@@ -1,0 +1,780 @@
+// ==UserScript==
+// @name         LinkedIn — Şirket Kara Listesi
+// @name:en      LinkedIn — Company Blacklist
+// @namespace    li-company-blacklist
+// @version      1.0.0
+// @description  İş arama sonuçlarında belirli şirketlerin ilanlarını gizler. Sağ tık menüsüyle veya panel üzerinden şirket ekleyip çıkarabilirsiniz.
+// @description:en Hides job listings from specific companies in LinkedIn job search. Add companies via right-click or the management panel.
+// @match        https://www.linkedin.com/*
+// @grant        none
+// @run-at       document-idle
+// @noframes
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  // ─── STORAGE ─────────────────────────────────────────────────────────────────
+  const STORAGE_KEY = 'licb-blacklist';   // [{ name, regex, addedAt }]
+  const ENABLED_KEY = 'licb-enabled';
+
+  function loadList() {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      return raw ? JSON.parse(raw) : [];
+    } catch { return []; }
+  }
+
+  function saveList(list) {
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(list)); } catch {}
+  }
+
+  function loadEnabled() {
+    try {
+      const v = localStorage.getItem(ENABLED_KEY);
+      return v === null ? true : v === '1';
+    } catch { return true; }
+  }
+
+  function saveEnabled(v) {
+    try { localStorage.setItem(ENABLED_KEY, v ? '1' : '0'); } catch {}
+  }
+
+  let blacklist = loadList();
+  let enabled   = loadEnabled();
+
+  // ─── ŞIRKET ADI NORMALLEŞTIRME ────────────────────────────────────────────────
+  function normName(s) {
+    return (s || '')
+      .trim()
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/\s+/g, ' ');
+  }
+
+  // Bir kart metni kara listedeki herhangi bir girişle eşleşiyor mu?
+  function isBlacklisted(companyName) {
+    if (!companyName) return false;
+    const n = normName(companyName);
+    for (const entry of blacklist) {
+      try {
+        if (entry.regex) {
+          if (new RegExp(entry.pattern, 'i').test(companyName)) return true;
+        } else {
+          if (normName(entry.name) === n) return true;
+        }
+      } catch {}
+    }
+    return false;
+  }
+
+  // Kara listede var mı? (düz isim ile)
+  function inList(name) {
+    const n = normName(name);
+    return blacklist.some(e => !e.regex && normName(e.name) === n);
+  }
+
+  function addCompany(name) {
+    if (!name || inList(name)) return false;
+    blacklist.push({ name: name.trim(), regex: false, addedAt: Date.now() });
+    saveList(blacklist);
+    return true;
+  }
+
+  function addPattern(pattern) {
+    if (!pattern) return false;
+    try { new RegExp(pattern); } catch { return false; }
+    if (blacklist.some(e => e.regex && e.pattern === pattern)) return false;
+    blacklist.push({ name: pattern, pattern, regex: true, addedAt: Date.now() });
+    saveList(blacklist);
+    return true;
+  }
+
+  function removeEntry(index) {
+    blacklist.splice(index, 1);
+    saveList(blacklist);
+  }
+
+  // ─── SELECTORS — şirket adı içeren elemanlar ─────────────────────────────────
+  const COMPANY_SELS = [
+    '.job-card-container__company-name',
+    '.job-card-list__company-name',
+    '.artdeco-entity-lockup__subtitle span',
+    '.base-search-card__subtitle',
+    '.job-search-card .base-search-card__subtitle a',
+    '[class*="company-name"]',
+    '.jobs-unified-top-card__company-name',
+    '.jobs-unified-top-card__company-name a',
+    '.topcard__org-name-link',
+    '.job-details-jobs-unified-top-card__company-name',
+    '.job-details-jobs-unified-top-card__company-name a',
+  ].join(',');
+
+  const CARD_SELS = [
+    '[data-occludable-job-id]',
+    'li.jobs-search-results__list-item',
+    'li.scaffold-layout__list-item',
+    'li.discovery-templates-entity-item',
+    'article.job-search-card',
+    'div.base-card',
+    'article.base-card',
+    'li.jobs-collections-module__list-item',
+  ].join(',');
+
+  // Bir iş kartından şirket adını çıkar
+  function getCompanyFromCard(card) {
+    for (const sel of COMPANY_SELS.split(',')) {
+      const el = card.querySelector(sel.trim());
+      if (el) {
+        const t = (el.textContent || '').trim();
+        if (t.length > 0 && t.length < 120) return t;
+      }
+    }
+    return null;
+  }
+
+  // En yakın iş kartını bul
+  function getCardFromEl(el) {
+    return el.closest(CARD_SELS) ?? null;
+  }
+
+  // ─── KARTLARı GİZLE / GÖSTER ─────────────────────────────────────────────────
+  function processCards() {
+    if (!isJobsPage()) { removeBadge(); return; }
+    ensureBadge();
+
+    let hidden = 0;
+    document.querySelectorAll(CARD_SELS).forEach(card => {
+      const company = getCompanyFromCard(card);
+      const shouldHide = enabled && company && isBlacklisted(company);
+
+      if (shouldHide) {
+        card.setAttribute('data-licb-hidden', '1');
+        hidden++;
+      } else {
+        card.removeAttribute('data-licb-hidden');
+      }
+    });
+
+    updateBadgeCount(hidden);
+  }
+
+  function isJobsPage() {
+    return location.pathname.includes('/jobs');
+  }
+
+  // ─── SAĞ TIK MENÜSÜ ──────────────────────────────────────────────────────────
+  let ctxMenu = null;
+
+  function removeCtxMenu() {
+    ctxMenu?.remove();
+    ctxMenu = null;
+  }
+
+  function showCtxMenu(x, y, companyName) {
+    removeCtxMenu();
+
+    const already = inList(companyName);
+    ctxMenu = document.createElement('div');
+    ctxMenu.id = 'licb-ctx';
+    ctxMenu.setAttribute('role', 'menu');
+
+    const header = document.createElement('div');
+    header.className = 'licb-ctx-header';
+    header.textContent = companyName.length > 30
+      ? companyName.slice(0, 28) + '…'
+      : companyName;
+
+    const btn = document.createElement('button');
+    btn.className = 'licb-ctx-btn' + (already ? ' remove' : '');
+    btn.setAttribute('role', 'menuitem');
+    btn.textContent = already ? '✓ Kara listeden çıkar' : '🚫 Bu şirketi gizle';
+    btn.addEventListener('click', () => {
+      if (already) {
+        const idx = blacklist.findIndex(e => !e.regex && normName(e.name) === normName(companyName));
+        if (idx !== -1) { removeEntry(idx); scheduleRefresh(); showToast(`"${companyName}" listeden çıkarıldı`); }
+      } else {
+        addCompany(companyName);
+        scheduleRefresh();
+        showToast(`"${companyName}" kara listeye eklendi`);
+      }
+      removeCtxMenu();
+    });
+
+    ctxMenu.appendChild(header);
+    ctxMenu.appendChild(btn);
+    document.body.appendChild(ctxMenu);
+
+    // Ekran sınırlarına göre konumlandır
+    const cw = ctxMenu.offsetWidth || 220;
+    const ch = ctxMenu.offsetHeight || 70;
+    ctxMenu.style.left = Math.min(x, window.innerWidth - cw - 8) + 'px';
+    ctxMenu.style.top  = Math.min(y, window.innerHeight - ch - 8) + 'px';
+  }
+
+  // Sağ tık olayını dinle
+  document.addEventListener('contextmenu', e => {
+    // Şirket adı içeren bir elemana mı tıklandı?
+    const companyEl = e.target.closest(COMPANY_SELS);
+    if (!companyEl) { removeCtxMenu(); return; }
+
+    const card    = getCardFromEl(companyEl);
+    const company = card ? getCompanyFromCard(card) : (companyEl.textContent || '').trim();
+    if (!company) { removeCtxMenu(); return; }
+
+    e.preventDefault();
+    showCtxMenu(e.clientX, e.clientY, company);
+  }, true);
+
+  document.addEventListener('click',   removeCtxMenu, true);
+  document.addEventListener('keydown', e => e.key === 'Escape' && removeCtxMenu(), true);
+
+  // ─── TOAST BİLDİRİMİ ─────────────────────────────────────────────────────────
+  function showToast(msg) {
+    let t = document.getElementById('licb-toast');
+    if (!t) {
+      t = document.createElement('div');
+      t.id = 'licb-toast';
+      document.body.appendChild(t);
+    }
+    t.textContent = msg;
+    t.classList.add('show');
+    clearTimeout(t._timer);
+    t._timer = setTimeout(() => t.classList.remove('show'), 2800);
+  }
+
+  // ─── YÖNETİM PANELİ ──────────────────────────────────────────────────────────
+  let panel = null;
+
+  function openPanel() {
+    if (panel && document.body.contains(panel)) { closePanel(); return; }
+
+    panel = document.createElement('div');
+    panel.id = 'licb-panel';
+
+    panel.innerHTML = `
+      <div class="licb-panel-header">
+        <span class="licb-panel-title">Kara Liste Yönetimi</span>
+        <button class="licb-panel-close" id="licb-close" aria-label="Kapat">✕</button>
+      </div>
+
+      <div class="licb-panel-add">
+        <input id="licb-input" type="text" placeholder="Şirket adı veya /regex/ girin…" autocomplete="off" spellcheck="false" />
+        <button id="licb-add-btn">Ekle</button>
+      </div>
+      <div class="licb-regex-hint">
+        Regex örneği: <code>/holding/i</code> → "ABC Holding", "XYZ Holdings" hepsini gizler
+      </div>
+
+      <div id="licb-list-wrap">
+        <div id="licb-list"></div>
+      </div>
+
+      <div class="licb-panel-footer">
+        <button id="licb-export">↓ Dışa Aktar</button>
+        <label class="licb-import-label" for="licb-import-input">↑ İçe Aktar</label>
+        <input id="licb-import-input" type="file" accept=".json" style="display:none" />
+        <button id="licb-clear-all">Tümünü Sil</button>
+      </div>
+    `;
+
+    document.body.appendChild(panel);
+    renderList();
+    bindPanelEvents();
+  }
+
+  function closePanel() {
+    panel?.remove();
+    panel = null;
+  }
+
+  function renderList() {
+    const listEl = document.getElementById('licb-list');
+    if (!listEl) return;
+
+    if (blacklist.length === 0) {
+      listEl.innerHTML = '<div class="licb-empty">Liste boş. Sağ tık menüsünden veya yukarıdan şirket ekleyebilirsiniz.</div>';
+      return;
+    }
+
+    listEl.innerHTML = '';
+    blacklist
+      .slice()
+      .sort((a, b) => a.name.localeCompare(b.name, 'tr'))
+      .forEach((entry, sortedIdx) => {
+        // Gerçek index'i bul
+        const realIdx = blacklist.indexOf(entry);
+        const row = document.createElement('div');
+        row.className = 'licb-row';
+
+        const badge = document.createElement('span');
+        badge.className = 'licb-row-badge' + (entry.regex ? ' regex' : '');
+        badge.textContent = entry.regex ? 'regex' : 'şirket';
+
+        const name = document.createElement('span');
+        name.className = 'licb-row-name';
+        name.textContent = entry.name;
+        name.title = entry.name;
+
+        const del = document.createElement('button');
+        del.className = 'licb-row-del';
+        del.textContent = '✕';
+        del.title = 'Listeden çıkar';
+        del.addEventListener('click', () => {
+          removeEntry(realIdx);
+          scheduleRefresh();
+          renderList();
+          updateBadgeCount(document.querySelectorAll('[data-licb-hidden]').length);
+        });
+
+        row.appendChild(badge);
+        row.appendChild(name);
+        row.appendChild(del);
+        listEl.appendChild(row);
+      });
+  }
+
+  function bindPanelEvents() {
+    document.getElementById('licb-close').addEventListener('click', closePanel);
+
+    const input  = document.getElementById('licb-input');
+    const addBtn = document.getElementById('licb-add-btn');
+
+    function doAdd() {
+      const val = input.value.trim();
+      if (!val) return;
+
+      // /pattern/ formatındaysa regex olarak ekle
+      const regexMatch = val.match(/^\/(.+)\/([gimsuy]*)$/);
+      let ok = false;
+      if (regexMatch) {
+        const pat = regexMatch[1] + (regexMatch[2] ? '' : '');
+        try {
+          new RegExp(regexMatch[1], regexMatch[2]);
+          ok = addPattern(val);
+          if (!ok) showToast('Bu desen zaten listede.');
+        } catch {
+          showToast('Geçersiz regex deseni.');
+          return;
+        }
+      } else {
+        ok = addCompany(val);
+        if (!ok) showToast(`"${val}" zaten listede.`);
+      }
+
+      if (ok) {
+        input.value = '';
+        scheduleRefresh();
+        renderList();
+        showToast(`"${val}" eklendi.`);
+      }
+    }
+
+    addBtn.addEventListener('click', doAdd);
+    input.addEventListener('keydown', e => e.key === 'Enter' && doAdd());
+
+    // Dışa aktar
+    document.getElementById('licb-export').addEventListener('click', () => {
+      const blob = new Blob([JSON.stringify(blacklist, null, 2)], { type: 'application/json' });
+      const url  = URL.createObjectURL(blob);
+      const a    = document.createElement('a');
+      a.href     = url;
+      a.download = 'linkedin-blacklist.json';
+      a.click();
+      URL.revokeObjectURL(url);
+    });
+
+    // İçe aktar
+    document.getElementById('licb-import-input').addEventListener('change', e => {
+      const file = e.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = ev => {
+        try {
+          const data = JSON.parse(ev.target.result);
+          if (!Array.isArray(data)) throw new Error();
+          let added = 0;
+          data.forEach(entry => {
+            if (!entry.name) return;
+            if (entry.regex) { if (addPattern(entry.name)) added++; }
+            else             { if (addCompany(entry.name)) added++; }
+          });
+          scheduleRefresh();
+          renderList();
+          showToast(`${added} giriş içe aktarıldı.`);
+        } catch { showToast('Geçersiz JSON dosyası.'); }
+      };
+      reader.readAsText(file);
+      e.target.value = '';
+    });
+
+    // Tümünü sil
+    document.getElementById('licb-clear-all').addEventListener('click', () => {
+      if (!confirm(`Kara listedeki ${blacklist.length} giriş silinecek. Emin misiniz?`)) return;
+      blacklist = [];
+      saveList(blacklist);
+      scheduleRefresh();
+      renderList();
+      showToast('Liste temizlendi.');
+    });
+
+    // Panel dışına tıklanınca kapat
+    setTimeout(() => {
+      document.addEventListener('click', outsideClickHandler);
+    }, 0);
+  }
+
+  function outsideClickHandler(e) {
+    if (panel && !panel.contains(e.target) && !e.target.closest('#licb-badge')) {
+      closePanel();
+      document.removeEventListener('click', outsideClickHandler);
+    }
+  }
+
+  // ─── ROZET (BADGE) ───────────────────────────────────────────────────────────
+  let badge    = null;
+  let countEl  = null;
+  let toggleBtn = null;
+
+  function ensureBadge() {
+    if (badge && document.body.contains(badge)) return;
+
+    badge = document.createElement('div');
+    badge.id = 'licb-badge';
+
+    countEl = document.createElement('span');
+    countEl.className = 'licb-count';
+    countEl.textContent = '0';
+
+    const lbl = document.createElement('span');
+    lbl.className = 'licb-lbl';
+    lbl.textContent = 'gizli';
+
+    const sep = document.createElement('div');
+    sep.className = 'licb-sep';
+
+    toggleBtn = document.createElement('button');
+    toggleBtn.type = 'button';
+    toggleBtn.textContent = 'Kara Liste';
+    toggleBtn.className = enabled ? 'on' : '';
+    toggleBtn.title = 'Gizlemeyi aç/kapat';
+    toggleBtn.addEventListener('click', e => {
+      e.stopPropagation();
+      enabled = !enabled;
+      saveEnabled(enabled);
+      toggleBtn.className = enabled ? 'on' : '';
+      scheduleRefresh();
+    });
+
+    const manageBtn = document.createElement('button');
+    manageBtn.type = 'button';
+    manageBtn.textContent = '⚙ Yönet';
+    manageBtn.className = 'manage';
+    manageBtn.title = 'Listeyi yönet';
+    manageBtn.addEventListener('click', e => {
+      e.stopPropagation();
+      openPanel();
+    });
+
+    badge.appendChild(countEl);
+    badge.appendChild(lbl);
+    badge.appendChild(sep);
+    badge.appendChild(toggleBtn);
+    badge.appendChild(manageBtn);
+    document.body.appendChild(badge);
+  }
+
+  function removeBadge() {
+    badge?.remove();
+    badge = countEl = toggleBtn = null;
+  }
+
+  function updateBadgeCount(n) {
+    if (countEl) countEl.textContent = String(n);
+  }
+
+  // ─── CSS ─────────────────────────────────────────────────────────────────────
+  function injectCSS() {
+    let el = document.getElementById('licb-style');
+    if (!el) {
+      el = document.createElement('style');
+      el.id = 'licb-style';
+      document.head.appendChild(el);
+    }
+    el.textContent = `
+      /* ── Gizleme ── */
+      [data-licb-hidden] {
+        height: 1px !important;
+        min-height: 0 !important;
+        max-height: 1px !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        overflow: hidden !important;
+        opacity: 0 !important;
+        pointer-events: none !important;
+      }
+
+      /* ── Rozet ── */
+      #licb-badge {
+        position: fixed;
+        top: 72px;
+        left: 14px;
+        z-index: 999998;
+        font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+        background: rgba(16,22,28,0.93);
+        border: 1px solid rgba(255,255,255,0.13);
+        border-radius: 999px;
+        padding: 5px 12px 5px 10px;
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+        user-select: none;
+      }
+      #licb-badge .licb-count {
+        font-size: 14px; font-weight: 700; color: #e4eaf0; min-width: 16px; text-align: right;
+      }
+      #licb-badge .licb-lbl {
+        font-size: 10px; color: #6e8090; font-weight: 500; margin-right: 2px;
+      }
+      #licb-badge .licb-sep {
+        width: 1px; height: 14px; background: rgba(255,255,255,0.12);
+      }
+      #licb-badge button {
+        border: 1px solid rgba(255,255,255,0.18);
+        border-radius: 999px;
+        padding: 3px 9px;
+        font-size: 10px; font-weight: 700; letter-spacing: 0.3px;
+        cursor: pointer;
+        background: rgba(255,255,255,0.07);
+        color: #9aabb8; font-family: inherit; line-height: 1.4;
+      }
+      #licb-badge button:hover { background: rgba(255,255,255,0.13); color: #c8d8e4; }
+      #licb-badge button.on {
+        background: rgba(220,38,38,0.22);
+        border-color: rgba(220,38,38,0.55);
+        color: #fca5a5;
+      }
+      #licb-badge button.manage {
+        background: rgba(255,255,255,0.06);
+        color: #8fa0af;
+      }
+      #licb-badge button.manage:hover { background: rgba(255,255,255,0.12); color: #c8d8e4; }
+
+      /* ── Sağ tık menüsü ── */
+      #licb-ctx {
+        position: fixed;
+        z-index: 999999;
+        background: #1a2330;
+        border: 1px solid rgba(255,255,255,0.15);
+        border-radius: 10px;
+        padding: 6px;
+        box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+        font-family: "Segoe UI", system-ui, sans-serif;
+        min-width: 200px;
+      }
+      .licb-ctx-header {
+        font-size: 11px; color: #6e8090; font-weight: 500;
+        padding: 4px 8px 6px; border-bottom: 1px solid rgba(255,255,255,0.09); margin-bottom: 4px;
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      }
+      .licb-ctx-btn {
+        width: 100%; text-align: left;
+        background: transparent; border: none;
+        color: #e0eaf4; font-size: 13px; font-family: inherit;
+        padding: 7px 10px; border-radius: 6px; cursor: pointer;
+      }
+      .licb-ctx-btn:hover { background: rgba(255,255,255,0.08); }
+      .licb-ctx-btn.remove { color: #fca5a5; }
+
+      /* ── Toast ── */
+      #licb-toast {
+        position: fixed;
+        bottom: 24px; left: 50%; transform: translateX(-50%) translateY(12px);
+        z-index: 999999;
+        background: #1a2330;
+        border: 1px solid rgba(255,255,255,0.13);
+        border-radius: 999px;
+        padding: 8px 18px;
+        font-family: "Segoe UI", system-ui, sans-serif;
+        font-size: 13px; color: #e0eaf4;
+        box-shadow: 0 4px 20px rgba(0,0,0,0.45);
+        opacity: 0; pointer-events: none;
+        transition: opacity 0.2s, transform 0.2s;
+        white-space: nowrap;
+      }
+      #licb-toast.show {
+        opacity: 1; transform: translateX(-50%) translateY(0);
+      }
+
+      /* ── Yönetim Paneli ── */
+      #licb-panel {
+        position: fixed;
+        top: 116px; left: 14px;
+        z-index: 999997;
+        width: 340px;
+        background: #111820;
+        border: 1px solid rgba(255,255,255,0.13);
+        border-radius: 14px;
+        box-shadow: 0 12px 40px rgba(0,0,0,0.55);
+        font-family: "Segoe UI", system-ui, sans-serif;
+        display: flex; flex-direction: column;
+        max-height: calc(100vh - 140px);
+        overflow: hidden;
+      }
+      .licb-panel-header {
+        display: flex; align-items: center; justify-content: space-between;
+        padding: 12px 14px 10px;
+        border-bottom: 1px solid rgba(255,255,255,0.09);
+      }
+      .licb-panel-title {
+        font-size: 13px; font-weight: 600; color: #d0dce8;
+      }
+      .licb-panel-close {
+        background: none; border: none; color: #6e8090; cursor: pointer;
+        font-size: 14px; padding: 2px 6px; border-radius: 6px;
+      }
+      .licb-panel-close:hover { color: #c8d8e4; background: rgba(255,255,255,0.08); }
+      .licb-panel-add {
+        display: flex; gap: 6px; padding: 10px 12px 4px;
+      }
+      .licb-panel-add input {
+        flex: 1; background: rgba(255,255,255,0.07); border: 1px solid rgba(255,255,255,0.12);
+        border-radius: 8px; padding: 6px 10px; color: #e0eaf4;
+        font-size: 12px; font-family: inherit; outline: none;
+      }
+      .licb-panel-add input:focus { border-color: rgba(100,180,255,0.4); }
+      .licb-panel-add input::placeholder { color: #4a5e70; }
+      .licb-panel-add button {
+        background: rgba(10,102,194,0.3); border: 1px solid rgba(10,102,194,0.5);
+        color: #7ec8ff; border-radius: 8px; padding: 6px 12px;
+        font-size: 12px; font-weight: 600; cursor: pointer; font-family: inherit;
+        white-space: nowrap;
+      }
+      .licb-panel-add button:hover { background: rgba(10,102,194,0.45); }
+      .licb-regex-hint {
+        font-size: 10px; color: #4a5e70; padding: 0 12px 8px;
+      }
+      .licb-regex-hint code {
+        background: rgba(255,255,255,0.07); padding: 1px 5px;
+        border-radius: 4px; color: #7ec8ff; font-size: 10px;
+      }
+      #licb-list-wrap {
+        flex: 1; overflow-y: auto; padding: 0 4px;
+      }
+      #licb-list-wrap::-webkit-scrollbar { width: 4px; }
+      #licb-list-wrap::-webkit-scrollbar-track { background: transparent; }
+      #licb-list-wrap::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.12); border-radius: 4px; }
+      #licb-list { padding: 4px 8px 8px; }
+      .licb-row {
+        display: flex; align-items: center; gap: 8px;
+        padding: 6px 6px; border-radius: 8px;
+      }
+      .licb-row:hover { background: rgba(255,255,255,0.04); }
+      .licb-row-badge {
+        font-size: 9px; font-weight: 700; letter-spacing: 0.3px;
+        padding: 2px 6px; border-radius: 999px; white-space: nowrap; flex-shrink: 0;
+        background: rgba(10,102,194,0.2); color: #7ec8ff;
+        border: 1px solid rgba(10,102,194,0.35);
+      }
+      .licb-row-badge.regex {
+        background: rgba(245,158,11,0.18); color: #fcd47a;
+        border-color: rgba(245,158,11,0.35);
+      }
+      .licb-row-name {
+        flex: 1; font-size: 12px; color: #c8d8e4;
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      }
+      .licb-row-del {
+        background: none; border: none; color: #4a5e70; cursor: pointer;
+        font-size: 12px; padding: 2px 6px; border-radius: 6px; flex-shrink: 0;
+      }
+      .licb-row-del:hover { color: #fca5a5; background: rgba(220,38,38,0.15); }
+      .licb-empty {
+        font-size: 12px; color: #4a5e70; text-align: center;
+        padding: 20px 12px; line-height: 1.6;
+      }
+      .licb-panel-footer {
+        display: flex; gap: 6px; padding: 10px 12px;
+        border-top: 1px solid rgba(255,255,255,0.09);
+      }
+      .licb-panel-footer button, .licb-import-label {
+        flex: 1; text-align: center;
+        background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.12);
+        color: #8fa0af; border-radius: 8px; padding: 5px 8px;
+        font-size: 11px; font-weight: 600; cursor: pointer; font-family: inherit;
+      }
+      .licb-panel-footer button:hover, .licb-import-label:hover {
+        background: rgba(255,255,255,0.11); color: #c8d8e4;
+      }
+      #licb-clear-all { color: #f87171 !important; border-color: rgba(220,38,38,0.25) !important; }
+      #licb-clear-all:hover { background: rgba(220,38,38,0.15) !important; }
+
+      @media (max-width: 900px) {
+        #licb-badge { top: 60px; left: 8px; }
+        #licb-panel { left: 8px; width: calc(100vw - 16px); }
+      }
+    `;
+  }
+
+  // ─── OBSERVER & ZAMANLAYICILAR ────────────────────────────────────────────────
+  let rafId    = null;
+  let mutTimer = null;
+
+  function scheduleRefresh() {
+    if (rafId) cancelAnimationFrame(rafId);
+    rafId = requestAnimationFrame(() => { rafId = null; processCards(); });
+  }
+
+  const observer = new MutationObserver(() => {
+    if (mutTimer) return;
+    mutTimer = setTimeout(() => { mutTimer = null; scheduleRefresh(); }, 180);
+  });
+
+  // ─── ROTA TAKİBİ ─────────────────────────────────────────────────────────────
+  let lastPath = location.pathname;
+
+  function onRouteChange() {
+    if (location.pathname === lastPath) return;
+    lastPath = location.pathname;
+    setTimeout(scheduleRefresh, 350);
+    setTimeout(scheduleRefresh, 900);
+    setTimeout(scheduleRefresh, 2000);
+  }
+
+  function patchHistory(method) {
+    const orig = history[method].bind(history);
+    history[method] = function (...args) {
+      const r = orig(...args);
+      onRouteChange();
+      return r;
+    };
+  }
+
+  // ─── BAŞLATMA ────────────────────────────────────────────────────────────────
+  function init() {
+    injectCSS();
+
+    if (isJobsPage()) {
+      scheduleRefresh();
+      setTimeout(scheduleRefresh, 600);
+      setTimeout(scheduleRefresh, 1800);
+    }
+
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    patchHistory('pushState');
+    patchHistory('replaceState');
+    window.addEventListener('popstate', onRouteChange);
+
+    setInterval(() => { if (isJobsPage()) scheduleRefresh(); }, 2500);
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init, { once: true });
+  } else {
+    init();
+  }
+
+})();
