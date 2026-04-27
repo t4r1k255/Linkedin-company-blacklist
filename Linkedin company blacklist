@@ -5,6 +5,7 @@
 // @version      1.0.0
 // @description  İş arama sonuçlarında belirli şirketlerin ilanlarını gizler. Sağ tık menüsüyle veya panel üzerinden şirket ekleyip çıkarabilirsiniz.
 // @description:en Hides job listings from specific companies in LinkedIn job search. Add companies via right-click or the management panel.
+// @author       t4r1k255
 // @match        https://www.linkedin.com/*
 // @grant        none
 // @run-at       document-idle
