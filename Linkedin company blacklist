@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LinkedIn — Şirket Kara Listesi
 // @name:en      LinkedIn — Company Blacklist
-// @namespace    li-company-blacklist
+// @namespace    https://github.com/t4r1k255/Linkedin-company-blacklist
 // @version      1.0.0
 // @description  İş arama sonuçlarında belirli şirketlerin ilanlarını gizler. Sağ tık menüsüyle veya panel üzerinden şirket ekleyip çıkarabilirsiniz.
 // @description:en Hides job listings from specific companies in LinkedIn job search. Add companies via right-click or the management panel.
